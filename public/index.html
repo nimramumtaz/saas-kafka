@@ -1,0 +1,41 @@
+<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Multi-Tenant SaaS Orders</title>
+<style>
+body{font-family:system-ui,sans-serif;max-width:900px;margin:20px auto;padding:0 12px;background:#f6f7f9;color:#222}
+.card{background:#fff;border-radius:10px;padding:16px;margin:12px 0;box-shadow:0 1px 3px #0002}
+button,select,input{padding:8px 12px;margin:3px;border-radius:6px;border:1px solid #bbb}
+button{background:#2563eb;color:#fff;border:0;cursor:pointer}
+pre{background:#111;color:#9f9;padding:10px;border-radius:8px;overflow:auto;max-height:240px}
+table{width:100%;border-collapse:collapse}td,th{padding:6px;border-bottom:1px solid #eee;text-align:left}
+</style></head><body>
+<h2>Multi-Tenant SaaS - Kafka Orders</h2>
+<div class="card" id="loginBox">
+  <select id="tenant"><option value="acme">Tenant A (acme)</option><option value="globex">Tenant B (globex)</option></select>
+  <input id="email" value="admin@acme.com"><input id="pw" type="password" value="password123">
+  <button onclick="login()">Login</button> <span id="who"></span>
+</div>
+<div class="card"><h3>Products</h3><table id="prods"></table>
+  <button onclick="order()">Place order (1 of each of first 2 products)</button></div>
+<div class="card"><h3>Orders</h3>
+  <button onclick="load('/api/v1/orders/slow')">Load N+1 (slow)</button>
+  <button onclick="load('/api/v1/orders')">Load JOIN (fast)</button> <b id="timing"></b>
+  <table id="orders"></table></div>
+<div class="card"><h3>Log</h3><pre id="log"></pre></div>
+<script>
+let token='',P=[];
+const $=id=>document.getElementById(id), log=m=>$('log').textContent=m+'\n'+$('log').textContent;
+$('tenant').onchange=e=>$('email').value='admin@'+e.target.value+'.com';
+const api=(p,o={})=>fetch(p,{...o,headers:{'content-type':'application/json',authorization:'Bearer '+token}}).then(r=>r.json().then(j=>({s:r.status,j})));
+async function login(){
+  const r=await fetch('/api/v1/auth/login',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({tenant:$('tenant').value,email:$('email').value,password:$('pw').value})});
+  const j=await r.json(); if(!r.ok) return log('Login failed'); token=j.token; $('who').textContent='Logged in: '+j.tenant; products();
+}
+async function products(){const {j}=await api('/api/v1/products');P=j;
+  $('prods').innerHTML='<tr><th>SKU</th><th>Name</th><th>Price</th><th>Stock</th></tr>'+j.map(p=>`<tr><td>${p.sku}</td><td>${p.name}</td><td>${p.price}</td><td>${p.stock}</td></tr>`).join('');}
+async function order(){
+  const {s,j}=await api('/api/v1/orders',{method:'POST',body:JSON.stringify({items:P.slice(0,2).map(p=>({productId:p.id,qty:1}))})});
+  log(s+' '+JSON.stringify(j)); setTimeout(products,1500);
+}
+async function load(u){const {j}=await api(u+'?limit=20'); $('timing').textContent=`${j.mode}: ${j.queries} queries, ${j.ms.toFixed(1)} ms`;
+  $('orders').innerHTML='<tr><th>Order</th><th>Status</th><th>Total</th><th>Items</th></tr>'+j.data.map(o=>`<tr><td>${o.id.slice(0,8)}</td><td>${o.status}</td><td>${o.total}</td><td>${o.items.length}</td></tr>`).join('');}
+</script></body></html>
