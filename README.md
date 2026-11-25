@@ -1,12 +1,19 @@
 # Multi-Tenant B2B SaaS - Kafka, DB Tuning & Serverless
 
-Node.js + Express + PostgreSQL (RLS) + KafkaJS (Redpanda/Upstash) + Serverless function (Vercel).
+Node.js + Express + PostgreSQL (Neon, with Row Level Security) + KafkaJS (Aiven Kafka) + Serverless function (Vercel).
+
+## Live Links
+- **GitHub repo:** https://github.com/nimramumtaz/saas-kafka
+- **Live app (Render):** _paste Render URL here_
+- **Serverless function (Vercel):** _paste Vercel URL here_/api/invoice
+- **Kafka:** Aiven Kafka (free tier), topic `tenant.orders`
+- **Database:** Neon PostgreSQL
 
 ## Architecture
 ```mermaid
 flowchart LR
   C[Client / Frontend] -->|JWT + x-tenant-id| A[API Gateway - Express]
-  A -->|202 Accepted + OrderCreated key=tenant_id| K[(Kafka topic: tenant.orders - 3 partitions)]
+  A -->|202 Accepted + OrderCreated key=tenant_id| K[(Kafka topic: tenant.orders)]
   K --> G[Consumer Group: order-processors]
   G -->|withTenant + RLS| D[(PostgreSQL - pooled)]
   G -->|HTTP| S[Serverless Invoice Fn - Vercel]
@@ -14,9 +21,9 @@ flowchart LR
 ```
 
 ## Multi-tenancy
-- **Model:** shared DB, `tenant_id` discriminator on every table.
-- **Resolution:** `tenant_id` is a signed JWT claim; optional `x-tenant-id` header must match or the API returns 403.
-- **Isolation (2 layers):** (1) every query runs through `withTenant()` which sets `app.tenant_id`; (2) PostgreSQL **Row Level Security** (`FORCE`) with a non-superuser role, so even a forgotten `WHERE` cannot leak data.
+- **Model:** shared database, `tenant_id` discriminator on every table.
+- **Resolution:** `tenant_id` is a signed JWT claim; the optional `x-tenant-id` header must match it, otherwise the API returns 403.
+- **Isolation (2 layers):** (1) every query runs through `withTenant()` which sets `app.tenant_id`; (2) PostgreSQL **Row Level Security** (`FORCE`) with a non-superuser role (`app_user`), so even a forgotten `WHERE` cannot leak data.
 - Prove it: `npm run isolation`.
 
 ## Test accounts (password: `password123`)
@@ -25,24 +32,22 @@ flowchart LR
 | A | acme | admin@acme.com |
 | B | globex | admin@globex.com |
 
-## Run locally (with Docker) - Docker nahi hai? SETUP-NO-DOCKER.md dekho
-
+## Run locally
+Without Docker (cloud Neon + Aiven): see [SETUP-NO-DOCKER.md](SETUP-NO-DOCKER.md).
 ```bash
 npm install
-docker compose up -d          # Postgres + Redpanda (Kafka)
-npm run seed:bulk             # tenants, users, products + 100k orders per tenant
-npm run dev                   # API + consumer on http://localhost:3000
+npm run seed:bulk      # tenants, users, products + bulk orders
+npm start              # API + consumer on http://localhost:3000 (set RUN_CONSUMER=true in .env)
 ```
-Open http://localhost:3000, log in, place an order. Optional: run the consumer separately with `npm run consumer` (set `RUN_CONSUMER=false`).
+With Docker instead: `docker compose up -d` first, then the same commands.
 
 ## Kafka
-- `POST /api/v1/orders` -> `202 Accepted` + `{partition, offset}`; event `OrderCreated` on `tenant.orders`.
+- `POST /api/v1/orders` -> `202 Accepted` + `{partition, offset}`; event `OrderCreated` on topic `tenant.orders`.
 - Message key = `tenant_id` -> per-tenant ordering (same partition).
-- Consumer (KafkaJS, group `order-processors`) inserts order, decrements inventory (idempotent via PK), logs `partition/offset`, calls the serverless invoice function.
-- Cloud: create Upstash/Aiven topic `tenant.orders`, set `KAFKA_BROKERS`, `KAFKA_SSL=true`, `KAFKA_USERNAME`, `KAFKA_PASSWORD`, `KAFKA_SASL_MECHANISM` in env.
+- Consumer (KafkaJS, group `order-processors`) inserts the order, decrements inventory (idempotent via primary key), logs `partition/offset`, and calls the serverless invoice function.
 
 ## Benchmarks
-Run `npm run benchmark` (writes `BENCHMARK_RESULTS.md`). **Paste your results + screenshots here:**
+Run `npm run benchmark` (writes `BENCHMARK_RESULTS.md`).
 
 | Test | Before | After |
 |---|---|---|
@@ -51,9 +56,24 @@ Run `npm run benchmark` (writes `BENCHMARK_RESULTS.md`). **Paste your results + 
 
 Connection pooling: `pg.Pool` with `max=20`, `idleTimeoutMillis=30000`, `connectionTimeoutMillis=5000` (`src/db.js`).
 
+## Screenshots
+
+> Edit the captions below to match what each screenshot shows (e.g. EXPLAIN ANALYZE before/after, Kafka consumer offsets, cold vs warm start).
+
+**Screenshot 1**
+
+<img width="1600" height="768" alt="Screenshot 1" src="https://github.com/user-attachments/assets/f1a80e9e-2799-4ccc-951a-02c834863575" />
+
+**Screenshot 2**
+
+<img width="1600" height="900" alt="Screenshot 2" src="https://github.com/user-attachments/assets/69c9c556-f87a-400b-917a-9b08b73e552b" />
+
+**Screenshot 3**
+
+<img width="1600" height="768" alt="Screenshot 3" src="https://github.com/user-attachments/assets/7cf8a484-01b2-404a-9cd0-6009525d8326" />
+
 ## Serverless cold vs warm start
-`api/invoice.js` keeps a module-level counter. First invocation per container = **cold** (`coldStart:true`), later = **warm**. Consumer logs `[invoice-fn] COLD/WARM | handler | roundtrip`.
-Record in this table (curl the Vercel URL, wait ~15 min idle, curl again):
+`api/invoice.js` keeps a module-level counter. The first invocation per container is a **cold start** (`coldStart:true`); later calls are **warm** (`coldStart:false`). The consumer logs `[invoice-fn] COLD/WARM | handler | roundtrip`.
 
 | Invocation | Type | Round-trip ms |
 |---|---|---|
@@ -61,12 +81,15 @@ Record in this table (curl the Vercel URL, wait ~15 min idle, curl again):
 | 2nd, 3rd | Warm | _fill_ |
 
 ## Deployment
-1. **Postgres:** Neon/Supabase/Render. Run `db/schema.sql` on it (admin user), then set `DATABASE_URL` (app_user), `ADMIN_DATABASE_URL`, `PG_SSL=true`, then `npm run seed:bulk`.
-2. **API + frontend + consumer:** Render/Railway Web Service, start `npm start`, env `RUN_CONSUMER=true` + all vars from `.env.example`.
-3. **Serverless:** push repo to GitHub -> import in Vercel -> `/api/invoice` is live. Set `INVOICE_FUNCTION_URL=https://<project>.vercel.app/api/invoice` on the API service.
+1. **Postgres (Neon):** run `db/schema.sql` in the SQL editor, set `DATABASE_URL` (app_user), `ADMIN_DATABASE_URL`, `PG_SSL=true`, then `npm run seed:bulk`.
+2. **Kafka (Aiven free tier):** create topic `tenant.orders`; set `KAFKA_BROKERS`, `KAFKA_SSL=true`, `KAFKA_USERNAME`, `KAFKA_PASSWORD`, `KAFKA_SASL_MECHANISM`, and the CA certificate (`KAFKA_CA_PATH` locally or `KAFKA_CA_B64` on the host).
+3. **API + frontend + consumer (Render):** start command `npm start`, env `RUN_CONSUMER=true`.
+4. **Serverless (Vercel):** import the repo; `/api/invoice` goes live. Set `INVOICE_FUNCTION_URL` on the API service.
 
 ## Viva cheat sheet
-- Trigger event: place order in UI or curl POST /orders -> show 202 with partition/offset.
-- Offsets: consumer terminal prints `partition= offset=`; or `docker compose exec redpanda rpk group describe order-processors`.
-- EXPLAIN live: `docker compose exec postgres psql -U postgres saas`, then
-  `EXPLAIN ANALYZE SELECT * FROM orders WHERE tenant_id=(SELECT id FROM tenants WHERE slug='acme') ORDER BY created_at DESC LIMIT 50;` (run `DROP INDEX idx_orders_tenant_created;` first for the "before").
+- Trigger an event: place an order in the UI -> show the `202` response with partition/offset.
+- Offsets: the consumer log prints `partition= offset=`; Aiven console > Topics > `tenant.orders` > Messages.
+- EXPLAIN live (Neon SQL Editor):
+  `DROP INDEX IF EXISTS idx_orders_tenant_created;` then
+  `EXPLAIN ANALYZE SELECT * FROM orders WHERE tenant_id=(SELECT id FROM tenants WHERE slug='acme') ORDER BY created_at DESC LIMIT 50;`
+  then `CREATE INDEX idx_orders_tenant_created ON orders (tenant_id, created_at DESC);` and run the EXPLAIN again.
